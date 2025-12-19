@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (large)
+data/processed/csv/
+data/processed/Wireshark files/
+*.pcapng
+*.arff
+
+# Useless folder
+Useless/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+temp_upload/
+*.tmp
