@@ -10,6 +10,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import joblib
+import tempfile
+import os
+
+# Import scapy for pcapng processing
+try:
+    from scapy.all import rdpcap, IP, TCP, UDP
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
 
 # Page config
 st.set_page_config(
@@ -52,6 +61,140 @@ def load_model():
     except Exception as e:
         st.error(f"Error loading model: {e}")
         return None, None, None, None, False
+
+
+def process_pcapng(file_bytes, feature_names):
+    """
+    Process pcapng file and extract CIC-compatible features.
+    """
+    if not SCAPY_AVAILABLE:
+        st.error("Scapy not installed. Run: pip install scapy")
+        return None
+    
+    from collections import defaultdict
+    
+    # Save uploaded file to temp location
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pcapng') as tmp_file:
+        tmp_file.write(file_bytes)
+        tmp_path = tmp_file.name
+    
+    try:
+        # Read packets
+        st.info("📦 Loading packets from pcapng...")
+        packets = rdpcap(tmp_path)
+        st.success(f"✅ Loaded {len(packets)} packets")
+        
+        # Group packets into flows
+        flows = defaultdict(list)
+        for pkt in packets:
+            if IP in pkt:
+                src_ip = pkt[IP].src
+                dst_ip = pkt[IP].dst
+                proto = pkt[IP].proto
+                
+                src_port = 0
+                dst_port = 0
+                
+                if TCP in pkt:
+                    src_port = pkt[TCP].sport
+                    dst_port = pkt[TCP].dport
+                elif UDP in pkt:
+                    src_port = pkt[UDP].sport
+                    dst_port = pkt[UDP].dport
+                
+                flow_key = tuple(sorted([
+                    (src_ip, src_port),
+                    (dst_ip, dst_port)
+                ])) + (proto,)
+                
+                flows[flow_key].append({
+                    'time': float(pkt.time),
+                    'size': len(pkt),
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                })
+        
+        st.info(f"📊 Found {len(flows)} network flows")
+        
+        # Extract features for each flow
+        flow_features = []
+        for flow_key, pkts in flows.items():
+            if len(pkts) < 2:
+                continue
+            
+            pkts = sorted(pkts, key=lambda x: x['time'])
+            times = [p['time'] for p in pkts]
+            sizes = [p['size'] for p in pkts]
+            
+            duration = (times[-1] - times[0]) * 1000000
+            if duration == 0:
+                duration = 1
+            
+            iats = np.diff(times) * 1000000
+            
+            first_src = pkts[0]['src_ip']
+            fwd_pkts = [p for p in pkts if p['src_ip'] == first_src]
+            bwd_pkts = [p for p in pkts if p['src_ip'] != first_src]
+            
+            fwd_times = [p['time'] for p in fwd_pkts]
+            fiat = np.diff(fwd_times) * 1000000 if len(fwd_times) > 1 else [0]
+            
+            bwd_times = [p['time'] for p in bwd_pkts]
+            biat = np.diff(bwd_times) * 1000000 if len(bwd_times) > 1 else [0]
+            
+            active_threshold = 1000000
+            active_times = iats[iats < active_threshold] if len(iats) > 0 else [0]
+            idle_times = iats[iats >= active_threshold] if len(iats) > 0 else [0]
+            
+            if len(active_times) == 0:
+                active_times = [0]
+            if len(idle_times) == 0:
+                idle_times = [0]
+            
+            features = {
+                'duration': duration,
+                'total_fiat': np.sum(fiat),
+                'total_biat': np.sum(biat),
+                'min_fiat': np.min(fiat) if len(fiat) > 0 else 0,
+                'min_biat': np.min(biat) if len(biat) > 0 else 0,
+                'max_fiat': np.max(fiat) if len(fiat) > 0 else 0,
+                'max_biat': np.max(biat) if len(biat) > 0 else 0,
+                'mean_fiat': np.mean(fiat) if len(fiat) > 0 else 0,
+                'mean_biat': np.mean(biat) if len(biat) > 0 else 0,
+                'flowPktsPerSecond': len(pkts) / (duration / 1000000) if duration > 0 else 0,
+                'flowBytesPerSecond': sum(sizes) / (duration / 1000000) if duration > 0 else 0,
+                'min_flowiat': np.min(iats) if len(iats) > 0 else 0,
+                'max_flowiat': np.max(iats) if len(iats) > 0 else 0,
+                'mean_flowiat': np.mean(iats) if len(iats) > 0 else 0,
+                'std_flowiat': np.std(iats) if len(iats) > 0 else 0,
+                'min_active': np.min(active_times),
+                'mean_active': np.mean(active_times),
+                'max_active': np.max(active_times),
+                'std_active': np.std(active_times),
+                'min_idle': np.min(idle_times),
+                'mean_idle': np.mean(idle_times),
+                'max_idle': np.max(idle_times),
+                'std_idle': np.std(idle_times),
+            }
+            flow_features.append(features)
+        
+        st.success(f"✅ Extracted features for {len(flow_features)} flows")
+        
+        if not flow_features:
+            return None
+        
+        df = pd.DataFrame(flow_features)
+        df = df.replace([np.inf, -np.inf], 0).fillna(0)
+        
+        # Ensure all required features exist
+        for f in feature_names:
+            if f not in df.columns:
+                df[f] = 0
+        
+        return df[feature_names]
+        
+    finally:
+        os.unlink(tmp_path)
 
 
 def create_gauge_chart(value, title):
@@ -209,9 +352,9 @@ def main():
     
     with col1:
         uploaded_file = st.file_uploader(
-            "Upload CSV file with network flow or packet data",
-            type=['csv'],
-            help="Upload extracted features or raw packet CSV"
+            "Upload CSV or PCAPNG file",
+            type=['csv', 'pcapng', 'pcap'],
+            help="Upload CIC features CSV or raw Wireshark capture (pcapng/pcap)"
         )
     
     with col2:
@@ -232,12 +375,19 @@ def main():
         try:
             with st.spinner("🔄 Analyzing traffic..."):
                 if uploaded_file is not None:
-                    df = pd.read_csv(uploaded_file)
+                    file_name = uploaded_file.name.lower()
+                    
+                    if file_name.endswith('.pcapng') or file_name.endswith('.pcap'):
+                        # Process PCAPNG file
+                        st.info(f"📁 Processing {uploaded_file.name}...")
+                        X = process_pcapng(uploaded_file.read(), feature_names)
+                    else:
+                        # Process CSV file
+                        df = pd.read_csv(uploaded_file)
+                        X = extract_features_from_csv(df, feature_names)
                 else:
                     df = pd.read_csv(selected_sample)
-                
-                # Extract features
-                X = extract_features_from_csv(df, feature_names)
+                    X = extract_features_from_csv(df, feature_names)
                 
                 if X is None or len(X) == 0:
                     st.error("Could not extract features from the data")
