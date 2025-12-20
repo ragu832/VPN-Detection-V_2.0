@@ -11,11 +11,16 @@ venv/
 .ipynb_checkpoints/
 
 # Data files (large)
-data/processed/csv/
-data/processed/Wireshark files/
+data/
+archive/
 *.pcapng
+*.pcap
 *.arff
-./data
+*.csv
+
+# Scenario files
+Scenario*/
+
 # Useless folder
 Useless/
 
